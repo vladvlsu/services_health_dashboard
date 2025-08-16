@@ -15,18 +15,17 @@ from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import List, Optional, Dict
+from collections import Counter
+from urllib.parse import urlparse
 
+# Rich imports for beautiful terminal output
 from rich.console import Console
-from rich.panel import Panel
 from rich.table import Table
 from rich.live import Live
 from rich.layout import Layout
 from rich.text import Text
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
-from rich.status import Status
 from rich.align import Align
-from rich.columns import Columns
-from rich import box
+from rich.tree import Tree
 
 @dataclass
 class Service:
@@ -83,6 +82,36 @@ class HealthMap:
         self.error_color = "bright_red"
         self.warning_color = "bright_yellow"
 
+        # Cached system metrics to avoid expensive polling each frame
+        self._sys_metrics = {'cpu': 25.0, 'mem': 45.0, 'disk': 35.0}
+        self._sys_metrics_last_ts = 0.0
+        self._sys_metrics_ttl = 3.0  # seconds
+
+        # Smooth blink phase for fading indicators
+        self.blink_phase = 0
+        self.blink_period = 6
+
+        # Subdomain discovery state (background)
+        self.subdomains_map: Dict[str, List[str]] = {}
+        self.subdomains_ts: Dict[str, float] = {}
+        self.subdomains_ttl: float = 24 * 60 * 60  # 24h TTL
+        self.subdomains_lock = threading.Lock()
+        self.subdomains_inflight = set()
+
+        # Subdomain health probing state (background)
+        self.sub_health_map: Dict[str, Dict[str, ServiceStatus]] = {}
+        self.sub_health_ts: Dict[str, float] = {}
+        self.sub_health_ttl: float = 15 * 60  # 15 minutes
+        self.sub_health_lock = threading.Lock()
+        self.sub_health_inflight = set()
+
+        # Domain info cache (origin IP, org/ISP, geo)
+        self.domain_info_map: Dict[str, dict] = {}
+        self.domain_info_ts: Dict[str, float] = {}
+        self.domain_info_ttl: float = 24 * 60 * 60  # 24h TTL
+        self.domain_info_lock = threading.Lock()
+        self.domain_info_inflight = set()
+
         self._setup_logging()
         self._show_startup_animation()
         self.load_config()
@@ -101,9 +130,45 @@ class HealthMap:
         self.logger = logging.getLogger(__name__)
 
     def _show_startup_animation(self):
-        """Silent startup - no animation"""
-        self.console.clear()
-        # Skip startup animation for clean interface
+        """Show a minimal transient pixel loading animation during startup."""
+        try:
+            self._startup_anim_stop = threading.Event()
+
+            def _worker():
+                frames = ["dim white", "white", "bold white", "white"]
+                i = 0
+                # transient=True to auto-clear when stopped
+                with Live(Align.center(Text("•", style="dim white")), refresh_per_second=8, console=self.console, transient=True) as live:
+                    while not self._startup_anim_stop.is_set():
+                        style = frames[i % len(frames)]
+                        t = Text("HEALTH MAP ", style=f"bold {self.pale_green}")
+                        t.append("•", style=style)
+                        live.update(Align.center(t))
+                        i += 1
+                        time.sleep(0.12)
+
+            self._startup_anim_thread = threading.Thread(target=_worker, daemon=True)
+            self._startup_anim_thread.start()
+        except Exception:
+            # Fallback: ensure clean screen even if animation fails
+            self.console.clear()
+
+    def _stop_startup_animation(self):
+        """Stop startup animation and clear the console before main UI."""
+        try:
+            ev = getattr(self, "_startup_anim_stop", None)
+            th = getattr(self, "_startup_anim_thread", None)
+            if ev:
+                ev.set()
+            if th and th.is_alive():
+                th.join(timeout=0.5)
+        except Exception:
+            pass
+        # Clear any residual artifacts
+        try:
+            self.console.clear()
+        except Exception:
+            pass
 
     def _setup_signal_handlers(self):
         """Setup signal handlers for graceful shutdown"""
@@ -136,7 +201,7 @@ class HealthMap:
         ip_services = [
             {
                 'name': 'ipapi.co',
-                'url': 'http://ipapi.co/json/',
+                'url': 'https://ipapi.co/json/',
                 'timeout': 8,
                 'parser': self._parse_ipapi_response
             },
@@ -330,7 +395,16 @@ class HealthMap:
         except:
             return 35.0
 
-
+    def _get_system_metrics(self):
+        """Return cached CPU, memory, and disk usage with TTL to reduce polling cost."""
+        now = time.time()
+        if now - self._sys_metrics_last_ts >= self._sys_metrics_ttl:
+            cpu_usage = self._get_cpu_usage()
+            memory_usage = self._get_memory_usage()
+            disk_usage = self._get_disk_usage()
+            self._sys_metrics = {'cpu': cpu_usage, 'mem': memory_usage, 'disk': disk_usage}
+            self._sys_metrics_last_ts = now
+        return self._sys_metrics['cpu'], self._sys_metrics['mem'], self._sys_metrics['disk']
 
     def load_config(self):
         """Load services configuration from JSON file"""
@@ -367,10 +441,27 @@ class HealthMap:
                     "url": "https://www.gosuslugi.ru/",
                     "timeout": 10,
                     "expected_status": 200
-                },
-                {
+                },                {
                     "name": "whatsapp",
                     "url": "https://www.whatsapp.com/?lang=ru_RU",
+                    "timeout": 10,
+                    "expected_status": 200
+                },
+                {
+                    "name": "rzd",
+                    "url": "https://www.rzd.ru/",
+                    "timeout": 10,
+                    "expected_status": 200
+                },
+                {
+                    "name": "viber",
+                    "url": "https://www.viber.com/ru/",
+                    "timeout": 10,
+                    "expected_status": 200
+                },
+                {
+                    "name": "truth_social",
+                    "url": "https://truthsocial.com/@realDonaldTrump/posts/115012532470689820",
                     "timeout": 10,
                     "expected_status": 200
                 },
@@ -539,6 +630,12 @@ class HealthMap:
 
         header_text = Text("HEALTH MAP", style=f"bold {self.pale_green}")
         header_text.append(f" {current_time}", style="dim white")
+        # Loading pixel animation (subtle)
+        frames = ["dim white", "white", "bold white", "white"]
+        style = frames[self.animation_frame % len(frames)]
+        header_text.append("  ")
+        header_text.append("•", style=style)
+        self.animation_frame = (self.animation_frame + 1) % 1000000
 
         return Align.center(header_text)
 
@@ -575,6 +672,514 @@ class HealthMap:
             summary_table.add_row("AVG", Text(avg_str, style=avg_color))
 
         return summary_table
+
+    def _create_insights_panel(self, statuses: List[ServiceStatus]) -> Table:
+        """Create compact insights panel with key highlights"""
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column("L", style=f"bold {self.pale_green}", width=5)
+        table.add_column("Value", style="bright_white", width=20, overflow="ellipsis")
+
+        table.add_row("INS", "INSIGHTS", style="dim")
+
+        # Fastest and slowest services by response time
+        times = [(s, s.response_time) for s in statuses if s.response_time is not None]
+        if times:
+            fastest = min(times, key=lambda t: t[1])[0]
+            slowest = max(times, key=lambda t: t[1])[0]
+            table.add_row("FAST", f"{fastest.name[:14]} {self.format_response_time(fastest.response_time)}")
+            table.add_row("SLOW", f"{slowest.name[:14]} {self.format_response_time(slowest.response_time)}")
+        else:
+            table.add_row("FAST", "N/A")
+            table.add_row("SLOW", "N/A")
+
+        # Failures and top error
+        failures = [s for s in statuses if not s.is_healthy]
+        if failures:
+            errors = [s.error for s in failures if s.error]
+            common = Counter(errors).most_common(1)
+            top_error = common[0][0] if common else "n/a"
+            table.add_row("FAIL", f"{len(failures)} ({top_error[:16]})")
+        else:
+            table.add_row("FAIL", "0")
+
+        # Average DNS time
+        dns_times = [s.dns_resolution_time for s in statuses if s.dns_resolution_time is not None]
+        if dns_times:
+            avg_dns = sum(dns_times) / len(dns_times)
+            dns_color = self.success_color if avg_dns < 50 else self.warning_color if avg_dns < 120 else self.error_color
+            table.add_row("DNS", Text(f"{avg_dns:.0f}ms", style=dns_color))
+        else:
+            table.add_row("DNS", "N/A")
+
+        return table
+
+    def _extract_base_domain(self, hostname: Optional[str]) -> Optional[str]:
+        """Extract base domain from hostname using simple heuristics (no heavy deps)."""
+        if not hostname:
+            return None
+        labels = hostname.lower().strip('.').split('.')
+        if len(labels) < 2:
+            return None
+        composite_suffixes = {
+            "co.uk", "org.uk", "ac.uk", "gov.uk",
+            "com.au", "net.au", "org.au",
+            "co.jp", "or.jp", "ne.jp",
+            "com.br", "com.tr"
+        }
+        sld_tld = ".".join(labels[-2:])
+        if sld_tld in composite_suffixes and len(labels) >= 3:
+            return ".".join(labels[-3:])
+        return sld_tld
+
+    def _discover_subdomains_worker(self, base_domain: str):
+        """Background worker to fetch subdomains from crt.sh and cache them."""
+        try:
+            url = f"https://crt.sh/?q=%25.{base_domain}&output=json"
+            resp = requests.get(url, timeout=6, headers={'User-Agent': 'HealthMap/1.0'})
+            subdomains: List[str] = []
+            if resp.status_code == 200:
+                try:
+                    data = resp.json()
+                except Exception:
+                    data = []
+                seen = set()
+                for item in data if isinstance(data, list) else []:
+                    name_val = item.get('name_value')
+                    if not name_val:
+                        continue
+                    for name in str(name_val).splitlines():
+                        name = name.strip().lower()
+                        if name.startswith('*.'):
+                            name = name[2:]
+                        if name and name.endswith(base_domain) and name != base_domain:
+                            if name not in seen:
+                                seen.add(name)
+                                subdomains.append(name)
+            with self.subdomains_lock:
+                self.subdomains_map[base_domain] = sorted(subdomains)[:1000]
+                self.subdomains_ts[base_domain] = time.time()
+        except Exception:
+            # On failure, mark timestamp to avoid tight refetch loops
+            with self.subdomains_lock:
+                self.subdomains_map.setdefault(base_domain, [])
+                self.subdomains_ts[base_domain] = time.time()
+        finally:
+            with self.subdomains_lock:
+                self.subdomains_inflight.discard(base_domain)
+
+    def _domain_info_worker(self, base_domain: str):
+        """Background worker: resolve base domain IP and fetch geo/hoster info with caching."""
+        ip = None
+        info: Dict[str, Optional[str]] = {
+            'ip': None,
+            'org': None,
+            'isp': None,
+            'city': None,
+            'country': None,
+            'region': None
+        }
+        try:
+            try:
+                ip = socket.gethostbyname(base_domain)
+                info['ip'] = ip
+            except Exception:
+                ip = None
+
+            if ip:
+                try:
+                    url = f"https://ipwho.is/{ip}?fields=ip,continent,country,region,city,org,isp,success,message"
+                    resp = requests.get(url, timeout=6, headers={'User-Agent': 'HealthMap/1.0'})
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        success = data.get('success', True)
+                        if success:
+                            info['org'] = data.get('org') or None
+                            info['isp'] = data.get('isp') or None
+                            info['city'] = data.get('city') or None
+                            info['country'] = data.get('country') or None
+                            info['region'] = data.get('region') or None
+                except Exception:
+                    pass
+        finally:
+            with self.domain_info_lock:
+                self.domain_info_map[base_domain] = info
+                self.domain_info_ts[base_domain] = time.time()
+                self.domain_info_inflight.discard(base_domain)
+
+    def _maybe_schedule_domain_info(self, statuses: List[ServiceStatus]):
+        """Schedule domain info fetch for base domains when TTL expired."""
+        bases = set()
+        for s in statuses:
+            try:
+                hostname = urlparse(s.url).hostname
+            except Exception:
+                hostname = None
+            base = self._extract_base_domain(hostname)
+            if base:
+                bases.add(base)
+
+        now = time.time()
+        for base in bases:
+            with self.domain_info_lock:
+                last = self.domain_info_ts.get(base, 0)
+                inflight = base in self.domain_info_inflight
+                need = (now - last) > self.domain_info_ttl or base not in self.domain_info_map
+                if need and not inflight:
+                    self.domain_info_inflight.add(base)
+                    t = threading.Thread(target=self._domain_info_worker, args=(base,), daemon=True)
+                    t.start()
+
+    def _get_city_code(self, city: str) -> str:
+        """Convert city name to compact city code."""
+        city_codes = {
+            'london': 'LON', 'new york': 'NYC', 'los angeles': 'LAX', 'chicago': 'CHI',
+            'san francisco': 'SFO', 'seattle': 'SEA', 'boston': 'BOS', 'washington': 'WAS',
+            'miami': 'MIA', 'atlanta': 'ATL', 'dallas': 'DFW', 'houston': 'HOU',
+            'denver': 'DEN', 'phoenix': 'PHX', 'las vegas': 'LAS', 'detroit': 'DTT',
+            'philadelphia': 'PHL', 'toronto': 'YYZ', 'vancouver': 'YVR', 'montreal': 'YUL',
+            'paris': 'PAR', 'amsterdam': 'AMS', 'frankfurt': 'FRA', 'zurich': 'ZUR',
+            'madrid': 'MAD', 'barcelona': 'BCN', 'rome': 'ROM', 'milan': 'MIL',
+            'berlin': 'BER', 'munich': 'MUC', 'vienna': 'VIE', 'prague': 'PRG',
+            'warsaw': 'WAW', 'stockholm': 'STO', 'copenhagen': 'CPH', 'oslo': 'OSL',
+            'helsinki': 'HEL', 'dublin': 'DUB', 'manchester': 'MAN', 'glasgow': 'GLA',
+            'edinburgh': 'EDI', 'birmingham': 'BHM', 'liverpool': 'LPL', 'bristol': 'BRS',
+            'tokyo': 'NRT', 'osaka': 'KIX', 'seoul': 'ICN', 'beijing': 'PEK',
+            'shanghai': 'PVG', 'hong kong': 'HKG', 'singapore': 'SIN', 'bangkok': 'BKK',
+            'mumbai': 'BOM', 'delhi': 'DEL', 'bangalore': 'BLR', 'chennai': 'MAA',
+            'sydney': 'SYD', 'melbourne': 'MEL', 'brisbane': 'BNE', 'perth': 'PER',
+            'auckland': 'AKL', 'wellington': 'WLG', 'johannesburg': 'JNB', 'cape town': 'CPT',
+            'cairo': 'CAI', 'dubai': 'DXB', 'doha': 'DOH', 'riyadh': 'RUH',
+            'tel aviv': 'TLV', 'istanbul': 'IST', 'moscow': 'SVO', 'st petersburg': 'LED',
+            'kiev': 'KBP', 'bucharest': 'OTP', 'sofia': 'SOF', 'athens': 'ATH',
+            'lisbon': 'LIS', 'porto': 'OPO', 'brussels': 'BRU', 'luxembourg': 'LUX',
+            'geneva': 'GVA', 'basel': 'BSL', 'lyon': 'LYS', 'marseille': 'MRS',
+            'nice': 'NCE', 'toulouse': 'TLS', 'strasbourg': 'SXB', 'nantes': 'NTE',
+            'bordeaux': 'BOD', 'lille': 'LIL', 'rennes': 'RNS', 'montpellier': 'MPL'
+        }
+        return city_codes.get(city.lower(), city[:3].upper() if city else "")
+
+    def _create_domain_info_panel(self, statuses: List[ServiceStatus]) -> Table:
+        """Create DOMAIN INFO panel summarizing origin IP, ORG/ISP, and geo per base domain."""
+        # Collect unique base domains
+        bases: List[str] = []
+        seen = set()
+        for s in statuses:
+            hostname = None
+            try:
+                hostname = urlparse(s.url).hostname
+            except Exception:
+                pass
+            base = self._extract_base_domain(hostname)
+            if base and base not in seen:
+                seen.add(base)
+                bases.append(base)
+        bases = sorted(bases)
+
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column("DOM", style=f"bold {self.pale_green}", width=18)
+        table.add_column("IP", width=14)
+        table.add_column("ORG/ISP", width=16, overflow="ellipsis")
+        table.add_column("LOC", width=16, overflow="ellipsis")
+
+        # Header
+        table.add_row("DINFO", "", "", "", style="dim")
+
+        with self.domain_info_lock:
+            for base in bases:
+                inflight = base in self.domain_info_inflight
+                info = self.domain_info_map.get(base)
+                if info is None and inflight:
+                    ip_txt = Text("loading", style="dim")
+                    org_txt = Text("", style="dim")
+                    loc_txt = Text("", style="dim")
+                elif info is None:
+                    ip_txt = Text("pending", style="dim")
+                    org_txt = Text("", style="dim")
+                    loc_txt = Text("", style="dim")
+                else:
+                    ip_disp = info.get('ip') or "n/a"
+                    org = info.get('org') or info.get('isp') or "n/a"
+                    city = info.get('city') or ""
+                    country = info.get('country') or ""
+                    
+                    # Use city codes for compact display
+                    city_code = self._get_city_code(city) if city else ""
+                    country_code = country[:2].upper() if country else ""
+                    
+                    if city_code and country_code:
+                        loc = f"{city_code}, {country_code}"
+                    else:
+                        loc = city_code or country_code or ""
+                    
+                    ip_txt = Text(ip_disp, style="bright_white")
+                    org_txt = Text(org, style="white")
+                    loc_txt = Text(loc, style="white")
+
+                table.add_row(base[:18], ip_txt, org_txt, loc_txt)
+
+        return table
+
+    def _probe_hostname(self, hostname: str, timeout: int = 5) -> ServiceStatus:
+        """Probe a hostname via HTTPS → HTTP, HEAD→GET fallback, consider 2xx–3xx healthy."""
+        dns_resolution_time = None
+        server_ip = None
+        last_error = None
+        try:
+            dns_start = time.time()
+            server_ip = socket.gethostbyname(hostname)
+            dns_resolution_time = (time.time() - dns_start) * 1000
+        except Exception:
+            pass
+
+        for scheme in ("https", "http"):
+            url = f"{scheme}://{hostname}/"
+            # HEAD first
+            try:
+                start = time.time()
+                resp = requests.head(url, timeout=timeout, allow_redirects=True, headers={'User-Agent': 'HealthMap/1.0'})
+                rt = (time.time() - start) * 1000
+                code = resp.status_code
+                if code in (405, 501):
+                    raise Exception("HEAD not allowed")
+                healthy = 200 <= code < 400
+                return ServiceStatus(
+                    name=hostname,
+                    url=url,
+                    is_healthy=healthy,
+                    status_code=code,
+                    response_time=rt,
+                    error=None,
+                    last_checked=datetime.now(),
+                    dns_resolution_time=dns_resolution_time,
+                    server_ip=server_ip
+                )
+            except Exception as e_head:
+                last_error = str(e_head)[:50]
+                # GET fallback
+                try:
+                    start = time.time()
+                    resp = requests.get(url, timeout=timeout, headers={'User-Agent': 'HealthMap/1.0'})
+                    rt = (time.time() - start) * 1000
+                    code = resp.status_code
+                    healthy = 200 <= code < 400
+                    return ServiceStatus(
+                        name=hostname,
+                        url=url,
+                        is_healthy=healthy,
+                        status_code=code,
+                        response_time=rt,
+                        error=None,
+                        last_checked=datetime.now(),
+                        dns_resolution_time=dns_resolution_time,
+                        server_ip=server_ip
+                    )
+                except Exception as e_get:
+                    last_error = str(e_get)[:50]
+                    continue
+
+        return ServiceStatus(
+            name=hostname,
+            url=f"https://{hostname}/",
+            is_healthy=False,
+            status_code=None,
+            response_time=None,
+            error=last_error or "No HTTP",
+            last_checked=datetime.now(),
+            dns_resolution_time=dns_resolution_time,
+            server_ip=server_ip
+        )
+
+    def _check_subdomains_for_base(self, base_domain: str, limit: int = 20):
+        """Check health of a subset of subdomains for a base domain in background."""
+        try:
+            with self.subdomains_lock:
+                subs = list(self.subdomains_map.get(base_domain, []))
+            subs = subs[:limit]
+            results: Dict[str, ServiceStatus] = {}
+            if subs:
+                with ThreadPoolExecutor(max_workers=10) as ex:
+                    future_to_sub = {ex.submit(self._probe_hostname, sub): sub for sub in subs}
+                    for future in as_completed(future_to_sub):
+                        sub = future_to_sub[future]
+                        try:
+                            results[sub] = future.result()
+                        except Exception as e:
+                            results[sub] = ServiceStatus(
+                                name=sub,
+                                url=f"https://{sub}/",
+                                is_healthy=False,
+                                status_code=None,
+                                response_time=None,
+                                error=str(e)[:50],
+                                last_checked=datetime.now(),
+                                dns_resolution_time=None,
+                                server_ip=None
+                            )
+            with self.sub_health_lock:
+                self.sub_health_map[base_domain] = results
+                self.sub_health_ts[base_domain] = time.time()
+        finally:
+            with self.sub_health_lock:
+                self.sub_health_inflight.discard(base_domain)
+
+    def _maybe_schedule_subdomain_health(self, statuses: List[ServiceStatus]):
+        """Schedule subdomain health checks when we have subdomains and TTL expired."""
+        bases = set()
+        for s in statuses:
+            try:
+                hostname = urlparse(s.url).hostname
+            except Exception:
+                hostname = None
+            base = self._extract_base_domain(hostname)
+            if base:
+                bases.add(base)
+
+        now = time.time()
+        for base in bases:
+            with self.subdomains_lock:
+                has_subs = bool(self.subdomains_map.get(base))
+            if not has_subs:
+                continue
+            with self.sub_health_lock:
+                last = self.sub_health_ts.get(base, 0)
+                inflight = base in self.sub_health_inflight
+                need = (now - last) > self.sub_health_ttl or base not in self.sub_health_map
+                if need and not inflight:
+                    self.sub_health_inflight.add(base)
+                    t = threading.Thread(target=self._check_subdomains_for_base, args=(base,), daemon=True)
+                    t.start()
+
+    def _maybe_schedule_subdomain_discovery(self, statuses: List[ServiceStatus]):
+        """Schedule subdomain discovery for base domains that need refresh."""
+        bases = set()
+        for s in statuses:
+            try:
+                hostname = urlparse(s.url).hostname
+            except Exception:
+                hostname = None
+            base = self._extract_base_domain(hostname)
+            if base:
+                bases.add(base)
+
+        now = time.time()
+        for base in bases:
+            with self.subdomains_lock:
+                last = self.subdomains_ts.get(base, 0)
+                inflight = base in self.subdomains_inflight
+                need = (now - last) > self.subdomains_ttl or base not in self.subdomains_map
+                if need and not inflight:
+                    self.subdomains_inflight.add(base)
+                    t = threading.Thread(target=self._discover_subdomains_worker, args=(base,), daemon=True)
+                    t.start()
+
+    def _create_subdomains_panel(self, statuses: List[ServiceStatus]):
+        """Render compact domains table with base domains and top subdomains."""
+        # Collect bases from current statuses
+        bases = []
+        seen_b = set()
+        for s in statuses:
+            hostname = None
+            try:
+                hostname = urlparse(s.url).hostname
+            except Exception:
+                pass
+            base = self._extract_base_domain(hostname)
+            if base and base not in seen_b:
+                seen_b.add(base)
+                bases.append(base)
+
+        # Show all base domains
+        bases = sorted(bases)
+
+        table = Table(show_header=False, box=None, padding=(0, 1))
+        table.add_column("DOM", style=f"bold {self.pale_green}", width=20)
+        table.add_column("SUBS", width=25, overflow="ellipsis")
+
+        # Header
+        table.add_row("DOMAINS", "TOP SUBDOMAINS", style="dim")
+
+        with self.subdomains_lock, self.sub_health_lock:
+            for base in bases:
+                subs = self.subdomains_map.get(base)
+                inflight = base in self.subdomains_inflight
+                sub_stats = self.sub_health_map.get(base, {})
+                measured = len(sub_stats)
+                up = sum(1 for st in sub_stats.values() if st.is_healthy)
+                avg_ms = None
+                rts = [st.response_time for st in sub_stats.values() if st.response_time]
+                if rts:
+                    avg_ms = sum(rts) / len(rts)
+
+                # Build compact base domain label
+                if subs is None:
+                    base_label = Text(f"{base} (pending)", style="dim")
+                    subs_text = Text("", style="dim")
+                elif inflight:
+                    base_label = Text(f"{base} (loading)", style="dim")
+                    subs_text = Text("", style="dim")
+                else:
+                    if measured:
+                        ratio = (up / measured) * 100
+                        color = self.success_color if ratio >= 80 else self.warning_color if ratio >= 50 else self.error_color
+                        if avg_ms is not None:
+                            base_text = f"{base} ({len(subs)}) {up}/{measured} {avg_ms:.0f}ms"
+                        else:
+                            base_text = f"{base} ({len(subs)}) {up}/{measured}"
+                        base_label = Text(base_text, style=color)
+                    else:
+                        base_label = Text(f"{base} ({len(subs) if subs else 0})", style="white")
+
+                    # Build compact subdomains list
+                    if subs:
+                        # Sort subdomains: healthy first, then by response time
+                        subs_with_stats = []
+                        subs_without_stats = []
+                        
+                        for sub in subs[:15]:  # Limit to first 15 for processing
+                            st = sub_stats.get(sub)
+                            if st:
+                                subs_with_stats.append((sub, st))
+                            else:
+                                subs_without_stats.append(sub)
+                        
+                        # Sort tested subs: healthy first, then by response time
+                        subs_with_stats.sort(key=lambda x: (not x[1].is_healthy, x[1].response_time or 9999))
+                        
+                        # Build compact subdomain text - show all subdomains
+                        sub_parts = []
+                        
+                        # Show all tested subdomains first
+                        for sub, st in subs_with_stats:
+                            ind_color = self.success_color if st.is_healthy else self.error_color
+                            ind_char = "●" if st.is_healthy else "●"
+                            
+                            # Very compact subdomain display
+                            sub_short = sub.replace(f".{base}", "") if sub.endswith(f".{base}") else sub
+                            if len(sub_short) > 12:
+                                sub_short = sub_short[:9] + "..."
+                            
+                            if st.response_time and st.response_time < 1000:
+                                sub_parts.append(f"{ind_char}{sub_short}({st.response_time:.0f}ms)")
+                            elif st.error:
+                                error_short = st.error[:4] if len(st.error) > 4 else st.error
+                                sub_parts.append(f"{ind_char}{sub_short}({error_short})")
+                            else:
+                                sub_parts.append(f"{ind_char}{sub_short}")
+                        
+                        # Show all untested subdomains
+                        for sub in subs_without_stats:
+                            sub_short = sub.replace(f".{base}", "") if sub.endswith(f".{base}") else sub
+                            if len(sub_short) > 12:
+                                sub_short = sub_short[:9] + "..."
+                            sub_parts.append(f"○{sub_short}")
+                        
+                        subs_text = Text(" ".join(sub_parts), style="white")
+                    else:
+                        subs_text = Text("no data", style="dim")
+
+                table.add_row(base_label, subs_text)
+
+        return table
 
     def _create_network_panel(self) -> Table:
         """Create compact network information without frame"""
@@ -618,10 +1223,23 @@ class HealthMap:
             network_table.add_row("PNG", Text(f"G:{ping_google:.0f}ms", style=ping_color))
 
         # Connection quality indicator
-        quality_color = self.success_color if connection_quality == "GOOD" else self.warning_color if connection_quality == "FAIR" else self.error_color
+        if connection_quality in ("EXCELLENT", "GOOD"):
+            quality_color = self.success_color
+        elif connection_quality == "FAIR":
+            quality_color = self.warning_color
+        elif connection_quality == "POOR":
+            quality_color = self.error_color
+        else:  # UNKNOWN or other
+            quality_color = "dim"
         network_table.add_row("QTY", Text(connection_quality, style=quality_color))
 
         return network_table
+
+    def _create_progress_bar(self, percentage: float, width: int = 4) -> str:
+        """Create accurate progress bar based on percentage"""
+        filled_chars = int((percentage / 100.0) * width)
+        empty_chars = width - filled_chars
+        return "█" * filled_chars + "▒" * empty_chars
 
     def _create_health_blocks_panel(self, statuses: List[ServiceStatus]) -> Table:
         """Create compact health blocks without frame"""
@@ -629,9 +1247,7 @@ class HealthMap:
         healthy_services = sum(1 for s in statuses if s.is_healthy)
 
         # Get system health metrics
-        cpu_usage = self._get_cpu_usage()
-        memory_usage = self._get_memory_usage()
-        disk_usage = self._get_disk_usage()
+        cpu_usage, memory_usage, disk_usage = self._get_system_metrics()
 
         health_table = Table(show_header=False, box=None, padding=(0, 1))
         health_table.add_column("Block", width=8, style=f"bold {self.pale_green}")
@@ -642,28 +1258,28 @@ class HealthMap:
 
         # Service health block
         health_pct = (healthy_services / total_services * 100) if total_services > 0 else 0
-        service_indicator = "████" if health_pct >= 90 else "███▒" if health_pct >= 70 else "██▒▒" if health_pct >= 50 else "█▒▒▒"
+        service_indicator = self._create_progress_bar(health_pct)
         service_color = self.success_color if health_pct >= 90 else self.warning_color if health_pct >= 70 else self.error_color
         health_table.add_row("SERVICES", Text(f"{service_indicator} {health_pct:.0f}%", style=service_color))
 
         # CPU health block
-        cpu_indicator = "████" if cpu_usage < 50 else "███▒" if cpu_usage < 70 else "██▒▒" if cpu_usage < 85 else "█▒▒▒"
+        cpu_indicator = self._create_progress_bar(cpu_usage)
         cpu_color = self.success_color if cpu_usage < 50 else self.warning_color if cpu_usage < 85 else self.error_color
         health_table.add_row("CPU", Text(f"{cpu_indicator} {cpu_usage:.0f}%", style=cpu_color))
 
         # Memory health block
-        mem_indicator = "████" if memory_usage < 60 else "███▒" if memory_usage < 80 else "██▒▒" if memory_usage < 90 else "█▒▒▒"
+        mem_indicator = self._create_progress_bar(memory_usage)
         mem_color = self.success_color if memory_usage < 60 else self.warning_color if memory_usage < 90 else self.error_color
         health_table.add_row("MEMORY", Text(f"{mem_indicator} {memory_usage:.0f}%", style=mem_color))
 
         # Disk health block
-        disk_indicator = "████" if disk_usage < 70 else "███▒" if disk_usage < 85 else "██▒▒" if disk_usage < 95 else "█▒▒▒"
+        disk_indicator = self._create_progress_bar(disk_usage)
         disk_color = self.success_color if disk_usage < 70 else self.warning_color if disk_usage < 95 else self.error_color
         health_table.add_row("DISK", Text(f"{disk_indicator} {disk_usage:.0f}%", style=disk_color))
 
         # Network health block (based on ping quality)
         net_health = 100 if hasattr(self, '_last_ping') and self._last_ping < 50 else 75 if hasattr(self, '_last_ping') and self._last_ping < 100 else 50
-        net_indicator = "████" if net_health >= 90 else "███▒" if net_health >= 70 else "██▒▒"
+        net_indicator = self._create_progress_bar(net_health)
         net_color = self.success_color if net_health >= 90 else self.warning_color if net_health >= 70 else self.error_color
         health_table.add_row("NETWORK", Text(f"{net_indicator} {net_health}%", style=net_color))
 
@@ -784,16 +1400,29 @@ class HealthMap:
         table.add_column("CODE", width=4, justify="center", style=f"bold {self.pale_green}")
         table.add_column("ERROR", style=f"bold {self.pale_green}", width=15, overflow="ellipsis")
 
-        # Simple blink state
-        self.blink_state = not self.blink_state
+        # Smooth fading blink phase (0..blink_period-1)
+        self.blink_phase = (self.blink_phase + 1) % self.blink_period
 
         for i, status in enumerate(statuses):
-            # Clean status indicator
+            # Fading status indicator
+            phase = self.blink_phase
             if status.is_healthy:
-                indicator = Text("●", style=f"bold {self.success_color}" if self.blink_state else f"dim {self.success_color}")
+                if phase in (0, 5):
+                    style = f"bold {self.success_color}"
+                elif phase in (1, 4):
+                    style = self.success_color
+                else:
+                    style = f"dim {self.success_color}"
+                indicator = Text("●", style=style)
                 status_text = Text("UP", style=self.success_color)
             else:
-                indicator = Text("○" if self.blink_state else "●", style=f"bold {self.error_color}")
+                if phase in (0, 5):
+                    style = f"bold {self.error_color}"
+                elif phase in (1, 4):
+                    style = self.error_color
+                else:
+                    style = f"dim {self.error_color}"
+                indicator = Text("●", style=style)
                 status_text = Text("DN", style=self.error_color)
 
             # Clean response time
@@ -845,111 +1474,140 @@ class HealthMap:
             Layout(name="services")             # Services with remaining space
         )
 
-        # Split info section into balanced columns with proper margins
+        # Split info section into ultra-tight columns with minimal spacing
         layout["info"].split_row(
             Layout(name="network", ratio=1),
             Layout(name="health", ratio=1),
-            Layout(name="summary", ratio=1)
+            Layout(name="summary", ratio=1),
+            Layout(name="insights", ratio=1),
+            Layout(name="domains", ratio=2),
+            Layout(name="dinfo", ratio=1)
         )
 
         # Add empty spacers for clean separation
         layout["spacer1"].update(Text(""))
         layout["spacer2"].update(Text(""))
 
+        # Trigger subdomain discovery in background (non-blocking)
+        self._maybe_schedule_subdomain_discovery(statuses)
+        # Trigger subdomain health checks in background (non-blocking)
+        self._maybe_schedule_subdomain_health(statuses)
+        # Trigger domain info fetch in background (non-blocking)
+        self._maybe_schedule_domain_info(statuses)
+
         # Populate layout with minimal design
         layout["header"].update(self._create_compact_header_panel())
         layout["network"].update(self._create_network_panel())
         layout["health"].update(self._create_health_blocks_panel(statuses))
         layout["summary"].update(self._create_compact_summary_panel(statuses))
+        layout["insights"].update(self._create_insights_panel(statuses))
+        layout["domains"].update(self._create_subdomains_panel(statuses))
+        layout["dinfo"].update(self._create_domain_info_panel(statuses))
 
         # Minimalist services table
         services_table = self._create_minimal_services_table(statuses)
         layout["services"].update(services_table)
 
+        # Render once
         self.console.print(layout)
 
     def run_once(self):
-        """Run health check once and display results"""
-        # Silent health check
-        statuses = self.check_all_services()
+        """Run a single health check and render the dashboard once."""
+        # Perform health checks while the startup animation is visible
+        try:
+            statuses = self.check_all_services()
+            for status in statuses:
+                self.current_statuses[status.name] = status
+        finally:
+            # Ensure the animation is stopped before first render
+            self._stop_startup_animation()
+
+        # Render once
         self.display_dashboard(statuses)
 
-        # Show minimal completion status
-        total_services = len(statuses)
-        healthy_services = sum(1 for s in statuses if s.is_healthy)
+    def run_continuous(self, interval: int = 10):
+        """Run continuous monitoring with a live-updating dashboard."""
+        # Sanitize interval
+        try:
+            self.check_interval = max(1, int(interval))
+        except Exception:
+            self.check_interval = 10
 
-        if healthy_services == total_services:
-            self.console.print(f"\n[{self.success_color}][+] All services healthy[/{self.success_color}]")
-        else:
-            failed = total_services - healthy_services
-            self.console.print(f"\n[{self.warning_color}][!] {failed} service(s) down[/{self.warning_color}]")
+        # Initial check while startup animation is visible
+        try:
+            statuses = self.check_all_services()
+            for status in statuses:
+                self.current_statuses[status.name] = status
+        finally:
+            # Stop startup animation before entering the UI loop
+            self._stop_startup_animation()
 
-    def run_continuous(self, check_interval: int = 10):
-        """Run health monitoring continuously with live dashboard updates"""
-        self.check_interval = check_interval
+        # Start background checker
         self.running = True
-
-        # Start background health checker thread
-        health_thread = threading.Thread(target=self._background_health_checker, daemon=True)
-        health_thread.start()
-
-        # Initial check and display
-        initial_statuses = self.check_all_services()
-        for status in initial_statuses:
-            self.current_statuses[status.name] = status
+        bg_thread = threading.Thread(target=self._background_health_checker, daemon=True)
+        bg_thread.start()
 
         try:
-            # Use Rich Live for real-time updates with adaptive refresh
-            with Live(console=self.console, refresh_per_second=2, screen=True) as live:
+            # Live UI loop
+            with Live(Text(""), refresh_per_second=8, console=self.console) as live:
                 while self.running:
-                    # Minimal adaptive refresh logic
-                    self.network_refresh_counter += 1
-                    self.services_refresh_counter += 1
-                    self.system_refresh_counter += 1
-
                     # Create minimalist layout with adaptive spacing
                     layout = Layout()
                     layout.split_column(
-                        Layout(name="header", size=1),      # Minimal header
-                        Layout(name="spacer1", size=1),     # Adaptive spacing
-                        Layout(name="info", size=6),        # Compact info section
-                        Layout(name="spacer2", size=1),     # Adaptive spacing
-                        Layout(name="services")             # Services with remaining space
+                        Layout(name="header", size=1),
+                        Layout(name="spacer1", size=1),
+                        Layout(name="info", size=6),
+                        Layout(name="spacer2", size=1),
+                        Layout(name="services")
                     )
 
-                    # Split info section into balanced columns with proper margins
+                    # Split info section into ultra-tight columns with minimal spacing
                     layout["info"].split_row(
                         Layout(name="network", ratio=1),
                         Layout(name="health", ratio=1),
-                        Layout(name="summary", ratio=1)
+                        Layout(name="summary", ratio=1),
+                        Layout(name="insights", ratio=1),
+                        Layout(name="domains", ratio=2),
+                        Layout(name="dinfo", ratio=1)
                     )
 
                     # Add empty spacers for clean separation
                     layout["spacer1"].update(Text(""))
                     layout["spacer2"].update(Text(""))
 
-                    # Populate layout with minimal adaptive refresh
+                    # Header
                     layout["header"].update(self._create_compact_header_panel())
 
                     # Network info refreshes less frequently
+                    self.network_refresh_counter += 1
                     if self.network_refresh_counter >= self.network_refresh_interval:
                         self._gather_network_info()
                         self.network_refresh_counter = 0
                     layout["network"].update(self._create_network_panel())
 
                     # System health refreshes at medium frequency
+                    self.system_refresh_counter += 1
                     if self.system_refresh_counter >= self.system_refresh_interval:
                         self.system_refresh_counter = 0
                     layout["health"].update(self._create_health_blocks_panel(self.get_current_statuses()))
 
                     # Services refresh more frequently
+                    self.services_refresh_counter += 1
                     if self.services_refresh_counter >= self.services_refresh_interval:
                         statuses = self.get_current_statuses()
                         self.services_refresh_counter = 0
                     else:
                         statuses = self.get_current_statuses()
 
+                    # Trigger subdomain discovery and health after statuses refresh
+                    self._maybe_schedule_subdomain_discovery(statuses)
+                    self._maybe_schedule_subdomain_health(statuses)
+                    self._maybe_schedule_domain_info(statuses)
+
                     layout["summary"].update(self._create_compact_summary_panel(statuses))
+                    layout["insights"].update(self._create_insights_panel(statuses))
+                    layout["domains"].update(self._create_subdomains_panel(statuses))
+                    layout["dinfo"].update(self._create_domain_info_panel(statuses))
 
                     # Minimalist services table
                     services_table = self._create_minimal_services_table(statuses)
@@ -967,11 +1625,15 @@ class HealthMap:
                     # Check for user input (non-blocking)
                     if self._check_user_input():
                         continue
-
         except KeyboardInterrupt:
             pass
         finally:
             self.running = False
+            try:
+                if bg_thread.is_alive():
+                    bg_thread.join(timeout=1.0)
+            except Exception:
+                pass
             self.console.print(f"\n[{self.pale_green}][>>] Goodbye! Health monitoring stopped.[/{self.pale_green}]")
 
     def _check_user_input(self) -> bool:
@@ -1029,6 +1691,11 @@ def main():
         health_map = HealthMap(args.config)
 
         if not health_map.services:
+            # Ensure startup animation is stopped on early exit
+            try:
+                health_map._stop_startup_animation()
+            except Exception:
+                pass
             console.print("[red][X] No services configured. Please edit the config file and try again.[/red]")
             return
 
@@ -1046,5 +1713,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

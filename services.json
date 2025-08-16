@@ -1,0 +1,58 @@
+{
+  "services": [
+    {
+      "name": "gemini",
+      "url": "https://gemini.google.com/",
+      "timeout": 10,
+      "expected_status": 200
+    },
+    {
+      "name": "claudfalre",
+      "url": "https://www.cloudflare.com/",
+      "timeout": 10,
+      "expected_status": 200
+    },
+    {
+      "name": "gosuslugi",
+      "url": "https://www.gosuslugi.ru/",
+      "timeout": 10,
+      "expected_status": 200
+    },
+    {
+      "name": "whatsapp",
+      "url": "https://www.whatsapp.com/?lang=ru_RU",
+      "timeout": 10,
+      "expected_status": 200
+    },
+    {
+      "name": "rzd",
+      "url": "https://www.rzd.ru/",
+      "timeout": 10,
+      "expected_status": 200
+    },
+    {
+      "name": "viber",
+      "url": "https://www.viber.com/ru/",
+      "timeout": 10,
+      "expected_status": 200
+    },
+    {
+      "name": "truth_social",
+      "url": "https://truthsocial.com/@realDonaldTrump/posts/115012532470689820",
+      "timeout": 10,
+      "expected_status": 200
+    },
+    {
+      "name": "telegram",
+      "url": "https://web.telegram.org/",
+      "timeout": 10,
+      "expected_status": 200
+    },
+    {
+      "name": "youtube",
+      "url": "https://www.youtube.com/",
+      "timeout": 10,
+      "expected_status": 200
+    }
+  ]
+}

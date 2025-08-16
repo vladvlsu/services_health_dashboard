@@ -1,2 +1,5 @@
 .kiro
+.ropeproject
+__pycache__
+health_map.log
 1
