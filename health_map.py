@@ -16,7 +16,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import List, Optional, Dict
 
-# Rich imports for beautiful terminal output
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
